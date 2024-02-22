@@ -2,10 +2,11 @@
 #![deny(warnings)]
 #![no_main]
 #![no_std]
+#![feature(type_alias_impl_trait)]
 
 use panic_halt as _;
 
-#[rtic::app(device = stm32f4xx_hal::pac, peripherals = true, dispatchers = [TIM2])]
+#[rtic::app(device = stm32f4xx_hal::pac, peripherals = true, dispatchers = [SPI1])]
 mod app {
 
     use hal::{
@@ -49,7 +50,6 @@ mod app {
 
         let rcc = dp.RCC.constrain();
         let clocks = rcc.cfgr.freeze();
-
 
         let gpioa = dp.GPIOA.split();
 
@@ -108,7 +108,7 @@ mod app {
         if transfer.is_idle() {
             rprintln!("idle");
             // Calc received bytes count
-            let bytes_count = BUFFER_SIZE - transfer.number_of_transfers() as usize;
+            //let bytes_count = BUFFER_SIZE - transfer.number_of_transfers() as usize;
 
             // Allocate new buffer
             let new_buffer = cx.local.rx_buffer.take().unwrap();
@@ -117,47 +117,26 @@ mod app {
             let (buffer, _) = transfer.next_transfer(new_buffer).unwrap();
 
             // Get slice for received bytes
-            let bytes = &buffer[..bytes_count];
-            //let trimmed_bytes = &bytes[2..bytes.len() - 2];
+            //let bytes = &buffer[..bytes_count];
 
-            let mut channel_values: [u16; 16] = [0; 16];
-
-            for i in (0..bytes.len()).step_by(2) {
-                // Extract two bytes from the pair
-                let byte1 = bytes[i];
-                let byte2 = bytes[i + 1];
-    
-                // Combine the bytes by multiplying the second number by 256
-                let combined_value = u16::from(byte1) + u16::from(byte2) * 256;
-
-                let channel_index = i / 2;
-                //rprintln!("index: {:?}", channel_index);
-                // Do something with the combined value (e.g., print or use it)
-
-                channel_values[channel_index] = combined_value;
-                //rprintln!("Combined Value: {}", combined_value);
-            }
-            //rprintln!("Bytes: {:?}", bytes);
-            rprintln!("Channels: {:?}", channel_values);
-        
-            
-            
-            // Do something with received bytes
-            // For example, parse it or send (buffer, bytes_count) to lock-free queue.
-            /*for &byte in bytes {
-                rprintln!("{:?} ", byte);
-            }*/
+            process_received_bytes::spawn(*buffer).unwrap();
 
             // Free buffer
             *cx.local.rx_buffer = Some(buffer);
-
-            
         }
     }
-    /* 
-    fn process_received_bytes(bytes: &[u8]) {
+
+    #[task(priority = 2)]
+    async fn process_received_bytes(
+        mut _ctx: process_received_bytes::Context,
+        buffer: [u8; BUFFER_SIZE],
+    ) {
         rprintln!("process received bytes");
-        // Process the bytes in pairs
+
+        let bytes = &buffer[..32];
+
+        let mut channel_values: [u16; 16] = [0; 16];
+
         for i in (0..bytes.len()).step_by(2) {
             // Extract two bytes from the pair
             let byte1 = bytes[i];
@@ -166,11 +145,14 @@ mod app {
             // Combine the bytes by multiplying the second number by 256
             let combined_value = u16::from(byte1) + u16::from(byte2) * 256;
 
-            // Do something with the combined value (e.g., print or use it)
-            rprintln!("Combined Value: {}", combined_value);
+            let channel_index = i / 2;
+            //rprintln!("index: {:?}", channel_index);
+            channel_values[channel_index] = combined_value;
+            //rprintln!("Combined Value: {}", combined_value);
         }
+        rprintln!("Bytes: {:?}", bytes);
+        rprintln!("Channels: {:?}", channel_values);
     }
-    */
 
     #[task(binds = DMA2_STREAM2, priority=1,shared = [rx_transfer])]
     fn dma2_stream2(mut cx: dma2_stream2::Context) {
