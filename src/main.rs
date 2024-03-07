@@ -11,10 +11,14 @@ mod kalman;
 mod app {
     use core::f32::consts::PI;
     use heapless::spsc::{Consumer, Producer, Queue};
-    use stm32f4xx_hal as hal;
+    use stm32f4xx_hal::{self as hal, pac::TIM5};
 
     use hal::{
-        dma::{config::DmaConfig, DmaFlag, PeripheralToMemory, Stream2, StreamsTuple, Transfer}, i2c::{I2c1, Mode}, pac::{DMA2, TIM2, USART1}, prelude::*, rcc::RccExt, serial, timer::{self, Event}
+        dma::{config::DmaConfig, DmaFlag, PeripheralToMemory, Stream2, StreamsTuple, Transfer}, 
+        i2c::{I2c1, Mode}, 
+        pac::{DMA2, TIM4, USART1}, 
+        prelude::*, rcc::RccExt, serial, 
+        timer::{self, Event}
     };
 
     use rtt_target::{rprintln, rtt_init_print};
@@ -46,16 +50,19 @@ mod app {
         /** FlySky Buffer **/
         rx_buffer: Option<&'static mut [u8; BUFFER_SIZE]>,
 
-
         /** Kalman Filter Variables **/
-        timer: timer::CounterMs<TIM2>,
+        kalman_timer: timer::CounterMs<TIM4>,
         imu: Lsm6dsox<I2c1>,
         i2c: I2c1,
         x_kalman: KalmanFilter,
         y_kalman: KalmanFilter,
 
         prod_kalman: Producer<'static, [f32; 2], 5>,
-        con_kalman: Consumer<'static, [f32; 2], 5>
+        con_kalman: Consumer<'static, [f32; 2], 5>,
+
+        /** Flight Controller variables **/
+        fc_timer: timer::CounterMs<TIM5>,
+        
     }
 
 
@@ -71,6 +78,8 @@ mod app {
         let (prod_kalman, con_kalman) = cx.local.queue_kalman.split();
 
         let dp: hal::pac::Peripherals = cx.device;
+
+        dp.SYSCFG.constrain();
 
         let rcc = dp.RCC.constrain();
         let clocks = rcc.cfgr.freeze();
@@ -118,7 +127,7 @@ mod app {
 
         let gpiob = dp.GPIOB.split();
 
-        //// LSM6DSOX IMU
+        //// LSM6DSOX IMU \\\\
 
         let scl = gpiob.pb6.into_open_drain_output();
         let sda = gpiob.pb7.into_open_drain_output();
@@ -143,11 +152,16 @@ mod app {
         let x_kalman = KalmanFilter::new();
         let y_kalman = KalmanFilter::new();
 
-
         // Kalman Filter Timer
-        let mut timer = dp.TIM2.counter_ms(&clocks);
-        timer.start(2000.millis()).unwrap();
-        timer.listen(Event::Update);
+        let mut kalman_timer = dp.TIM4.counter_ms(&clocks);
+        kalman_timer.start(2000.millis()).unwrap();
+        kalman_timer.listen(Event::Update);
+
+        // Flight Controller Timer
+
+        let mut fc_timer = dp.TIM5.counter_ms(&clocks);
+        fc_timer.start(2000.millis()).unwrap();
+        fc_timer.listen(Event::Update);
 
         (
             Shared { rx_transfer },
@@ -160,25 +174,11 @@ mod app {
 
                 prod_kalman,
                 con_kalman,
-                timer
+                kalman_timer,
+
+                fc_timer,
             },
         )
-    }
-
-    #[idle(local = [con_kalman])]
-    fn idle(ctx: idle::Context) -> ! {
-
-
-        rprintln!("idle");
-
-        loop {
-
-            //rprintln!("Kalman Filter x: {:?}, y: {:?}", *x_kal, *y_kal);
-            if let Some(data) = ctx.local.con_kalman.dequeue() {
-                rprintln!("Data: {:?}", data);
-            }
-
-        }
     }
 
     // Important! USART1 and DMA2_STREAM2 should the same interrupt priority!
@@ -188,7 +188,7 @@ mod app {
         let transfer = &mut cx.shared.rx_transfer;
 
         if transfer.is_idle() {
-            rprintln!("tansfer is idle");
+            rprintln!("transfer is idle");
             // Calc received bytes count
             let bytes_count = BUFFER_SIZE - transfer.number_of_transfers() as usize;
 
@@ -203,10 +203,10 @@ mod app {
             //copied_buffer.copy_from_slice(&buffer[..bytes_count]);
 
             // Get slice for received bytes
-            let _bytes = &buffer[..bytes_count];
-            rprintln!("Data PRE-PROC: {:?}", _bytes);
+            //let _bytes = &buffer[..bytes_count];
+            //rprintln!("Data PRE-PROC: {:?}", _bytes);
 
-            rprintln!("Byte count: {:?}", bytes_count);
+            //rprintln!("Byte count: {:?}", bytes_count);
 
             if bytes_count == 32 {
                 process_received_bytes::spawn(*buffer).unwrap();
@@ -220,7 +220,7 @@ mod app {
     }
 
 
-    #[task(priority = 2)]
+    #[task(priority = 1)]
     async fn process_received_bytes(mut _ctx: process_received_bytes::Context, buffer: [u8; BUFFER_SIZE]) {
         rprintln!("process received bytes");
 
@@ -252,9 +252,21 @@ mod app {
         }
 
         rprintln!("Channels: {:?}", channel_values);
+
+        //let _throttle = map(channel_values[5], 1000, 2000, 0, 100);
+        //let _desired_roll = map(channel_values[2], 1000, 2000, 0, 100);
+        //let _desired_pitch = map(channel_values[3], 1000, 2000, 0, 100);
+        
     }
 
-    #[task(binds = DMA2_STREAM2, priority=1,shared = [rx_transfer])]
+    /** Mapping Function **/
+    /* 
+    fn map(x: u16, in_min: u16, in_max: u16, out_min: u16, out_max: u16) -> u16 {
+        (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+    }
+    */
+
+    #[task(binds = DMA2_STREAM2, priority=1, shared = [rx_transfer])]
     fn dma2_stream2(mut cx: dma2_stream2::Context) {
         let transfer = &mut cx.shared.rx_transfer;
 
@@ -268,14 +280,16 @@ mod app {
             // See Transfer::init_peripheral_to_memory for details.
         }
     }
+    
 
+    #[task(binds = TIM5, local=[kalman_timer, imu, i2c, x_kalman, y_kalman, prod_kalman], priority = 1)]
+    fn sensor_fusion(ctx: sensor_fusion::Context) {
+        rprintln!("Sensor fusion");
 
-    #[task(binds = TIM2, local=[timer, imu, i2c, x_kalman, y_kalman, prod_kalman], priority = 1)]
-    fn timer_expired(ctx: timer_expired::Context) {
-        ctx.local.timer.clear_all_flags();
-        ctx.local.timer.start(12.millis()).unwrap();
+        ctx.local.kalman_timer.clear_all_flags();
+        ctx.local.kalman_timer.start(15.millis()).unwrap();
 
-        let delta_sec = 0.012;
+        let delta_sec = 0.015;
 
         let accel_data: [f32; 3];
         let gyro_data: [f32; 3];
@@ -305,5 +319,22 @@ mod app {
                 rprintln!("IMU Data failed to send: {:?}", err);
             }
         }
+    }
+
+    #[task(binds = TIM4, local = [fc_timer, con_kalman])]
+    fn flight_controller(ctx: flight_controller::Context) {
+        ctx.local.fc_timer.clear_all_flags();
+        ctx.local.fc_timer.start(1000.millis()).unwrap();
+
+        rprintln!("FC");
+
+        if let Some(data) = ctx.local.con_kalman.dequeue() {
+            rprintln!("Data: {:?}", data);
+        }
+
+        // Print Desired Angle (Kalman Filter output)
+
+        // Print Actual Angle (Remote Controller post-processing)
+
     }
 }
