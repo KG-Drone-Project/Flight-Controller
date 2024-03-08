@@ -11,6 +11,7 @@ mod kalman;
 mod app {
     use core::f32::consts::PI;
     use heapless::spsc::{Consumer, Producer, Queue};
+    use rtic_monotonics::{create_systick_token, systick::Systick};
     use stm32f4xx_hal::{self as hal, pac::TIM5};
 
     use hal::{
@@ -49,6 +50,9 @@ mod app {
     struct Local {
         /** FlySky Buffer **/
         rx_buffer: Option<&'static mut [u8; BUFFER_SIZE]>,
+        prod_flysky: Producer<'static, [u16; 16], 2>,
+        con_flysky: Consumer<'static, [u16; 16], 2>,
+
 
         /** Kalman Filter Variables **/
         kalman_timer: timer::CounterMs<TIM4>,
@@ -68,7 +72,8 @@ mod app {
 
     #[init(local = [
         rx_pool_memory: [u8; 400] = [0; 400],
-        queue_kalman: Queue<[f32; 2], 5> = Queue::new()
+        queue_kalman: Queue<[f32; 2], 5> = Queue::new(),
+        queue_flysky: Queue<[u16; 16], 2> = Queue::new(),
     ])]
     fn init(cx: init::Context) -> (Shared, Local) {
 
@@ -76,13 +81,21 @@ mod app {
         rprintln!("Init");
 
         let (prod_kalman, con_kalman) = cx.local.queue_kalman.split();
+        let (prod_flysky, con_flysky) = cx.local.queue_flysky.split();        
+
+        let token = create_systick_token!();
+        Systick::start(cx.core.SYST, 36_000_000, token);
 
         let dp: hal::pac::Peripherals = cx.device;
 
-        dp.SYSCFG.constrain();
-
         let rcc = dp.RCC.constrain();
-        let clocks = rcc.cfgr.freeze();
+
+        //let clocks = rcc.cfgr.freeze();
+        let clocks = rcc.cfgr
+            .use_hse(8.MHz())
+            .sysclk(36.MHz())
+            .pclk1(36.MHz())
+            .freeze();
 
 
         let gpioa = dp.GPIOA.split();
@@ -167,6 +180,9 @@ mod app {
             Shared { rx_transfer },
             Local {
                 rx_buffer: Some(rx_buffer2),
+                prod_flysky,
+                con_flysky,
+
                 imu,
                 i2c,
                 x_kalman,
@@ -185,10 +201,11 @@ mod app {
     #[task(binds = USART1, priority=1, local = [rx_buffer],shared = [rx_transfer])]
     fn usart1(mut cx: usart1::Context) {
         rprintln!("usart1 interrupt");
+        
         let transfer = &mut cx.shared.rx_transfer;
 
         if transfer.is_idle() {
-            rprintln!("transfer is idle");
+            //rprintln!("transfer is idle");
             // Calc received bytes count
             let bytes_count = BUFFER_SIZE - transfer.number_of_transfers() as usize;
 
@@ -210,6 +227,8 @@ mod app {
 
             if bytes_count == 32 {
                 process_received_bytes::spawn(*buffer).unwrap();
+            } else {
+                rprintln!("UART Data not 32 Bytes");
             }
 
             // Free buffer
@@ -220,13 +239,13 @@ mod app {
     }
 
 
-    #[task(priority = 1)]
-    async fn process_received_bytes(mut _ctx: process_received_bytes::Context, buffer: [u8; BUFFER_SIZE]) {
+    #[task(priority = 1, local=[prod_flysky])]
+    async fn process_received_bytes(ctx: process_received_bytes::Context, buffer: [u8; BUFFER_SIZE]) {
         rprintln!("process received bytes");
-
+        //Systick::delay(3.millis()).await;
         let bytes = &buffer[..32];
 
-        rprintln!("Bytes: {:?}", bytes);
+        //rprintln!("Bytes: {:?}", bytes);
 
         let mut channel_values: [u16; 16] = [0; 16];
 
@@ -251,8 +270,18 @@ mod app {
             }
         }
 
-        rprintln!("Channels: {:?}", channel_values);
+        //rprintln!("Channels: {:?}", channel_values);
+        match ctx.local.prod_flysky.enqueue(channel_values) {
+            Ok(()) => {
+                //rprintln!("Data sent");
+            }
 
+            Err(_err) => {
+                // Other errors occurred, handle them appropriately
+                // Example: println!("Error occurred while enqueueing data: {:?}", err);
+                rprintln!("Flysky failed to enqueue");
+            }
+        }
         //let _throttle = map(channel_values[5], 1000, 2000, 0, 100);
         //let _desired_roll = map(channel_values[2], 1000, 2000, 0, 100);
         //let _desired_pitch = map(channel_values[3], 1000, 2000, 0, 100);
@@ -282,14 +311,14 @@ mod app {
     }
     
 
-    #[task(binds = TIM5, local=[kalman_timer, imu, i2c, x_kalman, y_kalman, prod_kalman], priority = 1)]
+    #[task(binds = TIM4, local=[kalman_timer, imu, i2c, x_kalman, y_kalman, prod_kalman], priority = 1)]
     fn sensor_fusion(ctx: sensor_fusion::Context) {
+        ctx.local.kalman_timer.clear_all_flags();
+        ctx.local.kalman_timer.start(100.millis()).unwrap();
+
         rprintln!("Sensor fusion");
 
-        ctx.local.kalman_timer.clear_all_flags();
-        ctx.local.kalman_timer.start(15.millis()).unwrap();
-
-        let delta_sec = 0.015;
+        let delta_sec = 0.1;
 
         let accel_data: [f32; 3];
         let gyro_data: [f32; 3];
@@ -313,15 +342,15 @@ mod app {
                 //rprintln!("Data sent");
             }
 
-            Err(err) => {
+            Err(_err) => {
                 // Other errors occurred, handle them appropriately
                 // Example: println!("Error occurred while enqueueing data: {:?}", err);
-                rprintln!("IMU Data failed to send: {:?}", err);
+                rprintln!("IMU Data failed to send");
             }
         }
     }
 
-    #[task(binds = TIM4, local = [fc_timer, con_kalman])]
+    #[task(binds = TIM5, local = [fc_timer, con_kalman, con_flysky], priority = 1)]
     fn flight_controller(ctx: flight_controller::Context) {
         ctx.local.fc_timer.clear_all_flags();
         ctx.local.fc_timer.start(1000.millis()).unwrap();
@@ -329,9 +358,13 @@ mod app {
         rprintln!("FC");
 
         if let Some(data) = ctx.local.con_kalman.dequeue() {
-            rprintln!("Data: {:?}", data);
+            rprintln!("Kalman Data: {:?}", data);
         }
-
+        
+        if let Some(data) = ctx.local.con_flysky.dequeue() {
+            rprintln!("Flysky Data: {:?}", data);
+        }
+        
         // Print Desired Angle (Kalman Filter output)
 
         // Print Actual Angle (Remote Controller post-processing)
