@@ -21,8 +21,8 @@ pub struct KalmanFilter {
 impl KalmanFilter {
     pub fn new() -> Self {
         KalmanFilter {
-            q_ang: 0.001,
-            q_gyro: 0.003,
+            q_ang: 0.01,
+            q_gyro: 0.03,
             r: 0.03,
 
             x_post: [0., 0.],
