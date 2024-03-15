@@ -17,10 +17,10 @@ mod app {
 
     use hal::{
         i2c::{I2c1, Mode}, 
-        pac::{TIM4, USART1}, 
+        pac::{TIM1, TIM4, USART1}, 
         prelude::*, rcc::RccExt, 
-        serial::{Config, Serial, Rx}, 
-        timer::{self, Event}
+        serial::{Config, Rx, Serial}, 
+        timer::{self, Channel1, Channel2, Event, PwmChannel}
     };
 
     use rtt_target::{rprintln, rtt_init_print};
@@ -38,8 +38,8 @@ mod app {
     struct Local {
         /** FlySky Buffer **/
         rx: Rx<USART1, u8>,
-        prod_flysky: Producer<'static, [u16; 16], 2>,
-        con_flysky: Consumer<'static, [u16; 16], 2>,
+        prod_flysky: Producer<'static, [f32; 3], 2>,
+        con_flysky: Consumer<'static, [f32; 3], 2>,
 
 
         /** Kalman Filter Variables **/
@@ -54,14 +54,17 @@ mod app {
 
         /** Flight Controller variables **/
         fc_timer: timer::CounterMs<TIM5>,
-        
+
+        /** ESC **/
+        ch1: PwmChannel<TIM1, 0>
+
     }
 
 
     #[init(local = [
         rx_pool_memory: [u8; 400] = [0; 400],
         queue_kalman: Queue<[f32; 2], 5> = Queue::new(),
-        queue_flysky: Queue<[u16; 16], 2> = Queue::new(),
+        queue_flysky: Queue<[f32; 3], 2> = Queue::new(),
     ])]
     fn init(cx: init::Context) -> (Shared, Local) {
 
@@ -123,13 +126,24 @@ mod app {
 
         // Kalman Filter Timer
         let mut kalman_timer = dp.TIM4.counter_ms(&clocks);
-        kalman_timer.start(2000.millis()).unwrap();
+        kalman_timer.start(10000.millis()).unwrap();
         kalman_timer.listen(Event::Update);
+
+        // Motor Timer Setup
+        let channels = (Channel1::new(gpioa.pa8), Channel2::new(gpioa.pa9));
+        let pwm = dp.TIM1.pwm_hz(channels, 50.Hz(), &clocks).split();
+        let (mut ch1, _ch2) = pwm;
+        let max_duty = ch1.get_max_duty();
+        ch1.enable();
+
+        rprintln!("Zero signal");
+        ch1.set_duty(max_duty / 20);
+        rprintln!("ch1 Value: {:?}", [ch1.get_max_duty() / 20, ch1.get_max_duty() / 10]);
 
         // Flight Controller Timer
 
         let mut fc_timer = dp.TIM5.counter_ms(&clocks);
-        fc_timer.start(2000.millis()).unwrap();
+        fc_timer.start(10000.millis()).unwrap();
         fc_timer.listen(Event::Update);
 
         process_received_bytes::spawn().ok();
@@ -151,6 +165,8 @@ mod app {
                 kalman_timer,
 
                 fc_timer,
+                
+                ch1
             },
         )
     }
@@ -214,7 +230,12 @@ mod app {
             }
 
             //rprintln!("Channels: {:?}", channel_values);
-            match ctx.local.prod_flysky.enqueue(channel_values) {
+
+            let _throttle = channel_values[3] as f32;
+            let _desired_roll = map(channel_values[1] as f32, 1000., 2000., -15., 15.);
+            let _desired_pitch = map(channel_values[2] as f32, 1000., 2000., -15., 15.);
+
+            match ctx.local.prod_flysky.enqueue([_throttle, _desired_roll, _desired_pitch]) {
                 Ok(()) => {
                     //rprintln!("Data sent");
                 }
@@ -225,21 +246,18 @@ mod app {
                     rprintln!("Flysky failed to enqueue");
                 }
             }
-            //let _throttle = map(channel_values[5], 1000, 2000, 0, 100);
-            //let _desired_roll = map(channel_values[2], 1000, 2000, 0, 100);
-            //let _desired_pitch = map(channel_values[3], 1000, 2000, 0, 100);
 
-            Systick::delay(100.millis()).await;
+            Systick::delay(15.millis()).await;
         }
         
     }
 
     /** Mapping Function **/
-    /* 
-    fn map(x: u16, in_min: u16, in_max: u16, out_min: u16, out_max: u16) -> u16 {
+    
+    fn map(x: f32, in_min: f32, in_max: f32, out_min: f32, out_max: f32) -> f32 {
         (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
     }
-    */
+    
 
 
     #[task(binds = TIM4, local=[kalman_timer, imu, i2c, x_kalman, y_kalman, prod_kalman], priority = 1)]
@@ -281,10 +299,13 @@ mod app {
         }
     }
 
-    #[task(binds = TIM5, local = [fc_timer, con_kalman, con_flysky], priority = 1)]
+    #[task(binds = TIM5, local = [fc_timer, con_kalman, con_flysky, ch1], priority = 1)]
     fn flight_controller(ctx: flight_controller::Context) {
         ctx.local.fc_timer.clear_all_flags();
-        ctx.local.fc_timer.start(500.millis()).unwrap();
+        ctx.local.fc_timer.start(15.millis()).unwrap();
+
+        let ch1 = ctx.local.ch1;
+        let mut _fly_sky_data: [f32; 3] = [0., 0., 0.];
 
         rprintln!("FC");
 
@@ -293,12 +314,12 @@ mod app {
         }
         
         if let Some(data) = ctx.local.con_flysky.dequeue() {
+            _fly_sky_data = data;
             rprintln!("Flysky Data: {:?}", data);
+            
         }
-        
-        // Print Desired Angle (Kalman Filter output)
-
-        // Print Actual Angle (Remote Controller post-processing)
+        let _esc_value = map(_fly_sky_data[0], 1000., 2000., ch1.get_max_duty() as f32 / 20., ch1.get_max_duty() as f32 / 10.) as u16;
+         ch1.set_duty(_esc_value); 
 
     }
 }
