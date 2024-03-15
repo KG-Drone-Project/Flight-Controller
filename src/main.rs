@@ -17,7 +17,7 @@ mod app {
 
     use hal::{
         i2c::{I2c1, Mode}, 
-        pac::{TIM1, TIM4, USART1}, 
+        pac::{TIM1, TIM2, TIM4, USART1}, 
         prelude::*, rcc::RccExt, 
         serial::{Config, Rx, Serial}, 
         timer::{self, Channel1, Channel2, Event, PwmChannel}
@@ -56,7 +56,10 @@ mod app {
         fc_timer: timer::CounterMs<TIM5>,
 
         /** ESC **/
-        ch1: PwmChannel<TIM1, 0>
+        m1: PwmChannel<TIM1, 0>,
+        m2: PwmChannel<TIM1, 1>,
+        m3: PwmChannel<TIM2, 0>,
+        m4: PwmChannel<TIM2, 1>
 
     }
 
@@ -131,14 +134,27 @@ mod app {
 
         // Motor Timer Setup
         let channels = (Channel1::new(gpioa.pa8), Channel2::new(gpioa.pa9));
+        let channels_1 = (Channel1::new(gpioa.pa0), Channel2::new(gpioa.pa1));
+        
         let pwm = dp.TIM1.pwm_hz(channels, 50.Hz(), &clocks).split();
-        let (mut ch1, _ch2) = pwm;
-        let max_duty = ch1.get_max_duty();
-        ch1.enable();
+        let pwm_1 = dp.TIM2.pwm_hz(channels_1, 50.Hz(), &clocks).split();
+
+        let (mut m1, mut m2) = pwm;
+        let (mut m3, mut m4) = pwm_1;
+
+        let max_duty = m1.get_max_duty();
+        m1.enable();
+        m2.enable();
+        m3.enable();
+        m4.enable();
 
         rprintln!("Zero signal");
-        ch1.set_duty(max_duty / 20);
-        rprintln!("ch1 Value: {:?}", [ch1.get_max_duty() / 20, ch1.get_max_duty() / 10]);
+        m1.set_duty(max_duty / 20);
+        m2.set_duty(max_duty / 20);
+        m3.set_duty(max_duty / 20);
+        m4.set_duty(max_duty / 20);
+
+        //rprintln!("m1 Value: {:?}", [m1.get_max_duty() / 20, m1.get_max_duty() / 10]);
 
         // Flight Controller Timer
 
@@ -166,7 +182,7 @@ mod app {
 
                 fc_timer,
                 
-                ch1
+                m1, m2, m3, m4
             },
         )
     }
@@ -299,27 +315,44 @@ mod app {
         }
     }
 
-    #[task(binds = TIM5, local = [fc_timer, con_kalman, con_flysky, ch1], priority = 1)]
+    #[task(binds = TIM5, local = [fc_timer, con_kalman, con_flysky, m1, m2, m3, m4], priority = 1)]
     fn flight_controller(ctx: flight_controller::Context) {
         ctx.local.fc_timer.clear_all_flags();
         ctx.local.fc_timer.start(15.millis()).unwrap();
 
-        let ch1 = ctx.local.ch1;
-        let mut _fly_sky_data: [f32; 3] = [0., 0., 0.];
+        let m1 = ctx.local.m1;
+        let m2 = ctx.local.m2;
+        let m3 = ctx.local.m3;
+        let m4 = ctx.local.m4;
+
+        let mut kalman_data: [f32; 2] = [0., 0.];
+        let mut fly_sky_data: [f32; 3] = [0., 0., 0.];
 
         rprintln!("FC");
 
         if let Some(data) = ctx.local.con_kalman.dequeue() {
+            kalman_data = data;
             rprintln!("Kalman Data: {:?}", data);
         }
         
         if let Some(data) = ctx.local.con_flysky.dequeue() {
-            _fly_sky_data = data;
+            fly_sky_data = data;
             rprintln!("Flysky Data: {:?}", data);
             
         }
-        let _esc_value = map(_fly_sky_data[0], 1000., 2000., ch1.get_max_duty() as f32 / 20., ch1.get_max_duty() as f32 / 10.) as u16;
-         ch1.set_duty(_esc_value); 
+        let _esc_value = map(fly_sky_data[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16;
+        m1.set_duty(_esc_value); 
+        m2.set_duty(_esc_value);
+        m3.set_duty(_esc_value);
+        m4.set_duty(_esc_value);
+
+
+        // Get Error
+        let error_roll = fly_sky_data[1] - kalman_data[0];
+        let error_pitch = fly_sky_data[2] - kalman_data[1];
+
+        // PID
+
 
     }
 }
