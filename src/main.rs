@@ -142,17 +142,16 @@ mod app {
         let (mut m1, mut m2) = pwm;
         let (mut m3, mut m4) = pwm_1;
 
-        let max_duty = m1.get_max_duty();
         m1.enable();
         m2.enable();
         m3.enable();
         m4.enable();
 
         rprintln!("Zero signal");
-        m1.set_duty(max_duty / 20);
-        m2.set_duty(max_duty / 20);
-        m3.set_duty(max_duty / 20);
-        m4.set_duty(max_duty / 20);
+        m1.set_duty(m1.get_max_duty() / 20);
+        m2.set_duty(m2.get_max_duty() / 20);
+        m3.set_duty(m3.get_max_duty() / 20);
+        m4.set_duty(m4.get_max_duty() / 20);
 
         //rprintln!("m1 Value: {:?}", [m1.get_max_duty() / 20, m1.get_max_duty() / 10]);
 
@@ -340,16 +339,16 @@ mod app {
             rprintln!("Flysky Data: {:?}", data);
             
         }
-        let _esc_value = map(fly_sky_data[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16;
-        m1.set_duty(_esc_value); 
-        m2.set_duty(_esc_value);
-        m3.set_duty(_esc_value);
-        m4.set_duty(_esc_value);
+        //let _esc_value = map(fly_sky_data[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16;
+        m1.set_duty(map(fly_sky_data[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16); 
+        m2.set_duty(map(fly_sky_data[0], 1000., 2000., m2.get_max_duty() as f32 / 20., m2.get_max_duty() as f32 / 10.) as u16);
+        m3.set_duty(map(fly_sky_data[0], 1000., 2000., m3.get_max_duty() as f32 / 20., m3.get_max_duty() as f32 / 10.) as u16);
+        m4.set_duty(map(fly_sky_data[0], 1000., 2000., m4.get_max_duty() as f32 / 20., m4.get_max_duty() as f32 / 10.) as u16);
 
 
         // Get Error
-        let error_roll = fly_sky_data[1] - kalman_data[0];
-        let error_pitch = fly_sky_data[2] - kalman_data[1];
+        let _error_roll = fly_sky_data[1] - kalman_data[0];
+        let _error_pitch = fly_sky_data[2] - kalman_data[1];
 
         // PID
 
