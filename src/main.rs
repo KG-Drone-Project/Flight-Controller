@@ -340,9 +340,9 @@ mod app {
             
         }
         //let _esc_value = map(fly_sky_data[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16;
-        m1.set_duty(map(fly_sky_data[0], 1000., 2000., m1.get_max_duty() as f32 / 18., m1.get_max_duty() as f32 / 10.) as u16); 
-        m2.set_duty(map(fly_sky_data[0], 1000., 2000., m2.get_max_duty() as f32 / 18., m2.get_max_duty() as f32 / 10.) as u16);
-        m3.set_duty(map(fly_sky_data[0], 1000., 2000., m3.get_max_duty() as f32 / 18., m3.get_max_duty() as f32 / 10.) as u16);
+        m1.set_duty(map(fly_sky_data[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16); 
+        m2.set_duty(map(fly_sky_data[0], 1000., 2000., m2.get_max_duty() as f32 / 20., m2.get_max_duty() as f32 / 10.) as u16);
+        m3.set_duty(map(fly_sky_data[0], 1000., 2000., m3.get_max_duty() as f32 / 20., m3.get_max_duty() as f32 / 10.) as u16);
         m4.set_duty(map(fly_sky_data[0], 1000., 2000., m4.get_max_duty() as f32 / 20., m4.get_max_duty() as f32 / 10.) as u16);
 
         rprintln!("m1: {:?}, m2: {:?}, m3: {:?}, m4: {:?}", m1.get_duty(), m2.get_duty(), m3.get_duty(), m4.get_duty());
