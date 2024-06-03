@@ -1,19 +1,20 @@
-#![deny(unsafe_code)]
-#![deny(warnings)]
-#![allow(unused_assignments)]
 #![no_main]
 #![no_std]
 #![feature(type_alias_impl_trait)]
 
 use panic_halt as _;
 mod kalman;
+mod pid;
 
-#[rtic::app(device = stm32f4xx_hal::pac, peripherals = true, dispatchers = [SPI1, SPI2])]
+use rtic::app;
+
+#[app(device = stm32f4xx_hal::pac, dispatchers = [SPI1, SPI2])]
 mod app {
     use core::f32::consts::PI;
     use heapless::spsc::{Consumer, Producer, Queue};
     use rtic_monotonics::{create_systick_token, systick::Systick};
     use stm32f4xx_hal::{self as hal, pac::TIM5};
+    
 
     use hal::{
         i2c::{I2c1, Mode}, 
@@ -28,7 +29,11 @@ mod app {
     /** Kalman Filter Libraries **/
     use libm::{atanf, sqrtf};
     use crate::kalman::KalmanFilter;
+    use crate::pid::Pid;
     use lsm6dsox_driver::Lsm6dsox;
+
+    const FC_DELTA: u32 = 15;
+    const KALMAN_DELTA: u32 = 15;
 
     #[shared]
     struct Shared {
@@ -38,14 +43,13 @@ mod app {
     struct Local {
         /** FlySky Buffer **/
         rx: Rx<USART1, u8>,
-        prod_flysky: Producer<'static, [f32; 3], 2>,
-        con_flysky: Consumer<'static, [f32; 3], 2>,
+        prod_flysky: Producer<'static, [f32; 3], 10>,
+        con_flysky: Consumer<'static, [f32; 3], 10>,
 
 
         /** Kalman Filter Variables **/
         kalman_timer: timer::CounterMs<TIM4>,
         imu: Lsm6dsox<I2c1>,
-        i2c: I2c1,
         x_kalman: KalmanFilter,
         y_kalman: KalmanFilter,
 
@@ -54,20 +58,23 @@ mod app {
 
         /** Flight Controller variables **/
         fc_timer: timer::CounterMs<TIM5>,
+        previous_throttle: [f32; 4],
 
         /** ESC **/
         m1: PwmChannel<TIM1, 0>,
         m2: PwmChannel<TIM1, 1>,
         m3: PwmChannel<TIM2, 0>,
-        m4: PwmChannel<TIM2, 1>
+        m4: PwmChannel<TIM2, 1>,
 
+        pitch_pid: Pid,
+        roll_pid: Pid,
     }
 
 
     #[init(local = [
         rx_pool_memory: [u8; 400] = [0; 400],
         queue_kalman: Queue<[f32; 2], 5> = Queue::new(),
-        queue_flysky: Queue<[f32; 3], 2> = Queue::new(),
+        queue_flysky: Queue<[f32; 3], 10> = Queue::new(),
     ])]
     fn init(cx: init::Context) -> (Shared, Local) {
 
@@ -78,19 +85,20 @@ mod app {
         let (prod_flysky, con_flysky) = cx.local.queue_flysky.split();        
 
         let token = create_systick_token!();
-        Systick::start(cx.core.SYST, 36_000_000, token);
+        Systick::start(cx.core.SYST, 100_000_000, token);
 
         let dp: hal::pac::Peripherals = cx.device;
 
         let rcc = dp.RCC.constrain();
 
         //let clocks = rcc.cfgr.freeze();
-        let clocks = rcc.cfgr
-            .use_hse(8.MHz())
-            .sysclk(36.MHz())
-            .pclk1(36.MHz())
-            .freeze();
-
+        //let clocks = rcc.cfgr.hclk(8.MHz()).freeze();
+        let clocks = rcc.cfgr.use_hse(25.MHz()).sysclk(36.MHz()).hclk(25.MHz()).freeze();
+        // let clocks = rcc.cfgr
+        //     .use_hse(8.MHz())
+        //     .sysclk(36.MHz())
+        //     .pclk1(36.MHz())
+        //     .freeze();
 
         let gpioa = dp.GPIOA.split();
         let rx_pin = gpioa.pa10; // RX
@@ -107,21 +115,21 @@ mod app {
         let scl = gpiob.pb6.into_open_drain_output();
         let sda = gpiob.pb7.into_open_drain_output();
 
-        let mut i2c = dp.I2C1.i2c(
+        let i2c = dp.I2C1.i2c(
             (scl, sda),
             Mode::Standard {
-                frequency: 200.kHz(),
+                frequency: 104.kHz(),
             },
             &clocks,
         );
 
-        let imu = Lsm6dsox::new(&mut i2c).unwrap();
-
-        let id = imu.read_id(&mut i2c).unwrap();
+        let mut imu = Lsm6dsox::new(i2c).unwrap();
+        rprintln!("LSM6DSOX IMU initialized");
+        let id = imu.read_id().unwrap();
         rprintln!("id is {:#b}: ", id);
 
-        imu.configure_accel(&mut i2c).unwrap();
-        imu.configure_gyro(&mut i2c).unwrap();
+        imu.configure_accel().unwrap();
+        imu.configure_gyro().unwrap();
 
         // Kalman Filter
         let x_kalman = KalmanFilter::new();
@@ -155,7 +163,13 @@ mod app {
 
         //rprintln!("m1 Value: {:?}", [m1.get_max_duty() / 20, m1.get_max_duty() / 10]);
 
+        // PID
+        let pitch_pid = Pid::new(10.0, 0.1, 5.);
+        let roll_pid = Pid::new(10.0, 0.1, 5.);
+
         // Flight Controller Timer
+
+        let previous_throttle = [0.0, 0.0, 0.0, 0.0];
 
         let mut fc_timer = dp.TIM5.counter_ms(&clocks);
         fc_timer.start(10000.millis()).unwrap();
@@ -171,7 +185,6 @@ mod app {
                 con_flysky,
 
                 imu,
-                i2c,
                 x_kalman,
                 y_kalman,
 
@@ -180,8 +193,12 @@ mod app {
                 kalman_timer,
 
                 fc_timer,
-                
-                m1, m2, m3, m4
+                previous_throttle,
+
+                m1, m2, m3, m4,
+
+                pitch_pid,
+                roll_pid,
             },
         )
     }
@@ -192,7 +209,7 @@ mod app {
         let rx = ctx.local.rx;
 
 
-        loop {
+        //loop {
             rprintln!("process received bytes");
             
 
@@ -206,20 +223,10 @@ mod app {
                         // Ignore bytes until the first byte is 32 (space character)
                         continue;
                     }
-        
                     bytes[index] = byte;
                     index += 1;
-        
-                    // If the 32nd byte is encountered, process the buffer
-                    if index == 32 {
-                        //rprintln!("Data: {:?}", bytes);
-                        //index = 0; // Reset index for the next packet
-                    }
                 }
-            
             }
-
-            //rprintln!("Bytes: {:?}", bytes);
 
             let mut channel_values: [u16; 16] = [0; 16];
 
@@ -262,8 +269,8 @@ mod app {
                 }
             }
 
-            Systick::delay(15.millis()).await;
-        }
+            //Systick::delay(15.millis()).await;
+        //}
         
     }
 
@@ -275,14 +282,14 @@ mod app {
     
 
 
-    #[task(binds = TIM4, local=[kalman_timer, imu, i2c, x_kalman, y_kalman, prod_kalman], priority = 1)]
+    #[task(binds = TIM4, local=[kalman_timer, imu, x_kalman, y_kalman, prod_kalman], priority = 1)]
     fn sensor_fusion(ctx: sensor_fusion::Context) {
         ctx.local.kalman_timer.clear_all_flags();
-        ctx.local.kalman_timer.start(15.millis()).unwrap();
+        ctx.local.kalman_timer.start(KALMAN_DELTA.millis()).unwrap();
 
         rprintln!("Sensor fusion");
 
-        let delta_sec = 0.15;
+        let delta_sec = KALMAN_DELTA as f32 / 1000.0;
 
         let accel_data: [f32; 3];
         let gyro_data: [f32; 3];
@@ -291,16 +298,16 @@ mod app {
         let y_accel: f32;
 
         let imu = ctx.local.imu;
-
-        accel_data = imu.read_accel(ctx.local.i2c).unwrap();
-        gyro_data = imu.read_gyro(ctx.local.i2c).unwrap();
+        
+        accel_data = imu.read_accel().unwrap();
+        gyro_data = imu.read_gyro().unwrap();
 
         y_accel = atanf(accel_data[0] / sqrtf(accel_data[1] * accel_data[1] + accel_data[2] * accel_data[2])) * 180.0 / PI;
         x_accel = atanf(accel_data[1] / sqrtf(accel_data[0] * accel_data[0] + accel_data[2] * accel_data[2])) * 180.0/ PI;
 
         ctx.local.x_kalman.process_posterior_state(gyro_data[0], x_accel, delta_sec);
         ctx.local.y_kalman.process_posterior_state(gyro_data[1], y_accel, delta_sec);
-
+        
         match ctx.local.prod_kalman.enqueue([ctx.local.x_kalman.get_angle(), ctx.local.y_kalman.get_angle()]) {
             Ok(()) => {
                 //rprintln!("Data sent");
@@ -314,20 +321,32 @@ mod app {
         }
     }
 
-    #[task(binds = TIM5, local = [fc_timer, con_kalman, con_flysky, m1, m2, m3, m4], priority = 1)]
+    #[task(binds = TIM5, 
+           local = [fc_timer, con_kalman, con_flysky, 
+                    m1, m2, m3, m4, previous_throttle,
+                    pitch_pid, roll_pid], 
+            priority = 1)]
     fn flight_controller(ctx: flight_controller::Context) {
         ctx.local.fc_timer.clear_all_flags();
-        ctx.local.fc_timer.start(15.millis()).unwrap();
+        ctx.local.fc_timer.start(FC_DELTA.millis()).unwrap();
+
+        let new_flysky_data: bool;
+        let previous_throttle = ctx.local.previous_throttle;
 
         let m1 = ctx.local.m1;
         let m2 = ctx.local.m2;
         let m3 = ctx.local.m3;
         let m4 = ctx.local.m4;
 
+        let pitch_pid = ctx.local.pitch_pid;
+        let roll_pid = ctx.local.roll_pid;
+
         let mut kalman_data: [f32; 2] = [0., 0.];
         let mut fly_sky_data: [f32; 3] = [0., 0., 0.];
 
         rprintln!("FC");
+
+        process_received_bytes::spawn().ok();
 
         if let Some(data) = ctx.local.con_kalman.dequeue() {
             kalman_data = data;
@@ -337,21 +356,55 @@ mod app {
         if let Some(data) = ctx.local.con_flysky.dequeue() {
             fly_sky_data = data;
             rprintln!("Flysky Data: {:?}", data);
-            
-        }
-        //let _esc_value = map(fly_sky_data[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16;
-        m1.set_duty(map(fly_sky_data[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16); 
-        m2.set_duty(map(fly_sky_data[0], 1000., 2000., m2.get_max_duty() as f32 / 20., m2.get_max_duty() as f32 / 10.) as u16);
-        m3.set_duty(map(fly_sky_data[0], 1000., 2000., m3.get_max_duty() as f32 / 20., m3.get_max_duty() as f32 / 10.) as u16);
-        m4.set_duty(map(fly_sky_data[0], 1000., 2000., m4.get_max_duty() as f32 / 20., m4.get_max_duty() as f32 / 10.) as u16);
 
-        rprintln!("m1: {:?}, m2: {:?}, m3: {:?}, m4: {:?}", m1.get_duty(), m2.get_duty(), m3.get_duty(), m4.get_duty());
-        // Get Error
+            new_flysky_data = true; 
+        } else {
+            new_flysky_data = false;
+        }
+
+        // Error
         let _error_roll = fly_sky_data[1] - kalman_data[0];
         let _error_pitch = fly_sky_data[2] - kalman_data[1];
 
         // PID
+        let _pitch_pid_value = pitch_pid.compute(_error_pitch, FC_DELTA as f32 / 1000.);
+        let _roll_pid_value = roll_pid.compute(_error_roll, FC_DELTA as f32 / 1000.);
 
 
+        if new_flysky_data {
+            let mut throttle: [f32; 4] = [0.; 4];
+
+            throttle[0] = fly_sky_data[0] + _pitch_pid_value + _roll_pid_value;
+            throttle[1] = fly_sky_data[0] + _pitch_pid_value - _roll_pid_value;
+            throttle[2] = fly_sky_data[0] - _pitch_pid_value - _roll_pid_value;
+            throttle[3] = fly_sky_data[0] - _pitch_pid_value + _roll_pid_value;
+
+            for i in 0..4 {
+                if throttle[i] < 1000. {
+                    throttle[i] = 1000.;
+                }
+                if throttle[i] > 2000. {
+                    throttle[i] = 2000.;
+                }   
+            }
+            rprintln!("Pitch PID: {:?}, Roll PID: {:?}", _pitch_pid_value, _roll_pid_value);
+            rprintln!("Throttle: {:?}", throttle);
+
+            m1.set_duty(map(throttle[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16); 
+            m2.set_duty(map(throttle[0], 1000., 2000., m2.get_max_duty() as f32 / 20., m2.get_max_duty() as f32 / 10.) as u16);
+            m3.set_duty(map(throttle[0], 1000., 2000., m3.get_max_duty() as f32 / 20., m3.get_max_duty() as f32 / 10.) as u16);
+            m4.set_duty(map(throttle[0], 1000., 2000., m4.get_max_duty() as f32 / 20., m4.get_max_duty() as f32 / 10.) as u16);
+
+            *previous_throttle = throttle;
+
+        } else {
+            rprintln!("No new Flysky Data");
+            m1.set_duty(map(previous_throttle[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16); 
+            m2.set_duty(map(previous_throttle[1], 1000., 2000., m2.get_max_duty() as f32 / 20., m2.get_max_duty() as f32 / 10.) as u16);
+            m3.set_duty(map(previous_throttle[2], 1000., 2000., m3.get_max_duty() as f32 / 20., m3.get_max_duty() as f32 / 10.) as u16);
+            m4.set_duty(map(previous_throttle[3], 1000., 2000., m4.get_max_duty() as f32 / 20., m4.get_max_duty() as f32 / 10.) as u16);
+
+        }
+        
     }
 }
