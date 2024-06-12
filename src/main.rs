@@ -13,12 +13,12 @@ mod app {
     use core::f32::consts::PI;
     use heapless::spsc::{Consumer, Producer, Queue};
     use rtic_monotonics::{create_systick_token, systick::Systick};
-    use stm32f4xx_hal::{self as hal, pac::TIM5};
+    use stm32f4xx_hal::{self as hal};
     
 
     use hal::{
         i2c::{I2c1, Mode}, 
-        pac::{TIM1, TIM2, TIM4, USART1}, 
+        pac::{TIM1, TIM2, TIM3, TIM4, TIM5, USART1}, 
         prelude::*, rcc::RccExt, 
         serial::{Config, Rx, Serial}, 
         timer::{self, Channel1, Channel2, Event, PwmChannel}
@@ -45,6 +45,7 @@ mod app {
         rx: Rx<USART1, u8>,
         prod_flysky: Producer<'static, [f32; 3], 10>,
         con_flysky: Consumer<'static, [f32; 3], 10>,
+        rc_timer: timer::CounterMs<TIM3>,
 
 
         /** Kalman Filter Variables **/
@@ -58,7 +59,6 @@ mod app {
 
         /** Flight Controller variables **/
         fc_timer: timer::CounterMs<TIM5>,
-        previous_throttle: [f32; 4],
 
         /** ESC **/
         m1: PwmChannel<TIM1, 0>,
@@ -107,6 +107,9 @@ mod app {
         let rx: Rx<USART1, u8> =
             Serial::rx(dp.USART1, rx_pin, Config::default().baudrate(115200.bps()), &clocks).unwrap();
 
+        let mut rc_timer = dp.TIM3.counter_ms(&clocks);
+        rc_timer.start(10000.millis()).unwrap();
+        rc_timer.listen(Event::Update);
 
         let gpiob = dp.GPIOB.split();
 
@@ -164,18 +167,15 @@ mod app {
         //rprintln!("m1 Value: {:?}", [m1.get_max_duty() / 20, m1.get_max_duty() / 10]);
 
         // PID
-        let pitch_pid = Pid::new(10.0, 0.1, 5.);
-        let roll_pid = Pid::new(10.0, 0.1, 5.);
+        let pitch_pid = Pid::new(2.0, 0.1, 0.1);
+        let roll_pid = Pid::new(2.0, 0.1, 0.1);
 
         // Flight Controller Timer
-
-        let previous_throttle = [0.0, 0.0, 0.0, 0.0];
-
         let mut fc_timer = dp.TIM5.counter_ms(&clocks);
         fc_timer.start(10000.millis()).unwrap();
         fc_timer.listen(Event::Update);
 
-        process_received_bytes::spawn().ok();
+        //process_received_bytes::spawn().ok();
 
         (
             Shared {  },
@@ -183,6 +183,7 @@ mod app {
                 rx,
                 prod_flysky,
                 con_flysky,
+                rc_timer,
 
                 imu,
                 x_kalman,
@@ -193,7 +194,6 @@ mod app {
                 kalman_timer,
 
                 fc_timer,
-                previous_throttle,
 
                 m1, m2, m3, m4,
 
@@ -203,59 +203,68 @@ mod app {
         )
     }
 
-    #[task(priority = 1, local=[prod_flysky, rx])]
-    async fn process_received_bytes(ctx: process_received_bytes::Context) {
+    #[task(binds = TIM3, priority = 1, local=[rc_timer, prod_flysky, rx])]
+    fn process_received_bytes(ctx: process_received_bytes::Context) {
 
+        ctx.local.rc_timer.clear_all_flags();
+        ctx.local.rc_timer.start(15.millis()).unwrap();
+        
         let rx = ctx.local.rx;
 
-
-        //loop {
-            rprintln!("process received bytes");
+        rprintln!("process received bytes");
             
 
-            let mut bytes = [0u8; 32];
-            let mut index = 0;
+        let mut bytes = [0u8; 32];
+        let mut index = 0;
+        let mut checksum: u16 = 0;
 
-
-            while index != 32 {
-                if let Ok(byte) = rx.read() {
-                    if index == 0 && byte != 32 {
-                        // Ignore bytes until the first byte is 32 (space character)
-                        continue;
-                    }
-                    bytes[index] = byte;
-                    index += 1;
+        while index != 32 {
+            if let Ok(byte) = rx.read() {
+                if index == 0 && byte != 32 {
+                    // Ignore bytes until the first byte is 32 (space character)
+                    continue;
                 }
+                bytes[index] = byte;
+                index += 1;
             }
+        }
 
-            let mut channel_values: [u16; 16] = [0; 16];
+        //rprintln!("bytes: {:?}", bytes);
+        let mut channel_values: [u16; 16] = [0; 16];
 
-            for i in (0..bytes.len()).step_by(2) {
-                if i + 1 < bytes.len() {
-                    // Extract two bytes from the pair
-                    let byte1 = bytes[i];
-                    let byte2 = bytes[i + 1];
+        for i in (0..bytes.len()).step_by(2) {
+            if i + 1 < bytes.len() {
+                // Extract two bytes from the pair
+                let byte1 = u16::from(bytes[i]);
+                let byte2 = u16::from(bytes[i + 1]);
 
-                    // Combine the bytes by multiplying the second number by 256
-                    //let combined_value = u16::from(byte1) + u16::from(byte2) * 256;
-                    let combined_value = u16::from(byte1) | (u16::from(byte2) << 8);
-
-                    let channel_index = i / 2;
-                    //rprintln!("index: {:?}", channel_index);
-                    // Do something with the combined value (e.g., print or use it)
-
-                    channel_values[channel_index] = combined_value;
-                    //rprintln!("Combined Value: {}", combined_value);
-                } else {
-                    break
+                if i < 30 {
+                    checksum += byte1 + byte2;
                 }
-            }
+                
+                // Combine the bytes by multiplying the second number by 256
+                //let combined_value = u16::from(byte1) + u16::from(byte2) * 256;
+                let combined_value = byte1 | byte2 << 8;
 
+                let channel_index = i / 2;
+                //rprintln!("index: {:?}", channel_index);
+                // Do something with the combined value (e.g., print or use it)
+
+                channel_values[channel_index] = combined_value;
+                //rprintln!("Combined Value: {}", combined_value);
+            } else {
+                break
+            }
+        }
+
+        if 65535 - channel_values[15] != u16::from(checksum) {             
+            rprintln!("{:?} != {:?}", 65535 - channel_values[15], checksum);                            
+        } else {
+        
             //rprintln!("Channels: {:?}", channel_values);
-
-            let _throttle = channel_values[3] as f32;
-            let _desired_roll = map(channel_values[1] as f32, 1000., 2000., -15., 15.);
-            let _desired_pitch = map(channel_values[2] as f32, 1000., 2000., -15., 15.);
+            let mut _throttle = channel_values[3] as f32;
+            let mut _desired_roll = map(channel_values[1] as f32, 1000., 2000., -15., 15.);
+            let mut _desired_pitch = map(channel_values[2] as f32, 1000., 2000., -15., 15.);
 
             match ctx.local.prod_flysky.enqueue([_throttle, _desired_roll, _desired_pitch]) {
                 Ok(()) => {
@@ -268,9 +277,7 @@ mod app {
                     rprintln!("Flysky failed to enqueue");
                 }
             }
-
-            //Systick::delay(15.millis()).await;
-        //}
+        }
         
     }
 
@@ -285,11 +292,11 @@ mod app {
     #[task(binds = TIM4, local=[kalman_timer, imu, x_kalman, y_kalman, prod_kalman], priority = 1)]
     fn sensor_fusion(ctx: sensor_fusion::Context) {
         ctx.local.kalman_timer.clear_all_flags();
-        ctx.local.kalman_timer.start(KALMAN_DELTA.millis()).unwrap();
+        ctx.local.kalman_timer.start(15.millis()).unwrap();
 
         rprintln!("Sensor fusion");
 
-        let delta_sec = KALMAN_DELTA as f32 / 1000.0;
+        let delta_sec = 0.015;
 
         let accel_data: [f32; 3];
         let gyro_data: [f32; 3];
@@ -308,7 +315,8 @@ mod app {
         ctx.local.x_kalman.process_posterior_state(gyro_data[0], x_accel, delta_sec);
         ctx.local.y_kalman.process_posterior_state(gyro_data[1], y_accel, delta_sec);
         
-        match ctx.local.prod_kalman.enqueue([ctx.local.x_kalman.get_angle(), ctx.local.y_kalman.get_angle()]) {
+        // [roll, pitch]
+        match ctx.local.prod_kalman.enqueue([ctx.local.y_kalman.get_angle(), ctx.local.x_kalman.get_angle()]) {
             Ok(()) => {
                 //rprintln!("Data sent");
             }
@@ -323,15 +331,12 @@ mod app {
 
     #[task(binds = TIM5, 
            local = [fc_timer, con_kalman, con_flysky, 
-                    m1, m2, m3, m4, previous_throttle,
+                    m1, m2, m3, m4,
                     pitch_pid, roll_pid], 
             priority = 1)]
     fn flight_controller(ctx: flight_controller::Context) {
         ctx.local.fc_timer.clear_all_flags();
         ctx.local.fc_timer.start(FC_DELTA.millis()).unwrap();
-
-        let new_flysky_data: bool;
-        let previous_throttle = ctx.local.previous_throttle;
 
         let m1 = ctx.local.m1;
         let m2 = ctx.local.m2;
@@ -346,8 +351,6 @@ mod app {
 
         rprintln!("FC");
 
-        process_received_bytes::spawn().ok();
-
         if let Some(data) = ctx.local.con_kalman.dequeue() {
             kalman_data = data;
             rprintln!("Kalman Data: {:?}", data);
@@ -356,55 +359,41 @@ mod app {
         if let Some(data) = ctx.local.con_flysky.dequeue() {
             fly_sky_data = data;
             rprintln!("Flysky Data: {:?}", data);
-
-            new_flysky_data = true; 
-        } else {
-            new_flysky_data = false;
-        }
+        } 
 
         // Error
-        let _error_roll = fly_sky_data[1] - kalman_data[0];
-        let _error_pitch = fly_sky_data[2] - kalman_data[1];
+        let _error_roll =  kalman_data[0];
+        let _error_pitch = kalman_data[1];
 
         // PID
         let _pitch_pid_value = pitch_pid.compute(_error_pitch, FC_DELTA as f32 / 1000.);
         let _roll_pid_value = roll_pid.compute(_error_roll, FC_DELTA as f32 / 1000.);
 
 
-        if new_flysky_data {
-            let mut throttle: [f32; 4] = [0.; 4];
+        let mut throttle: [f32; 4] = [0.; 4];
 
-            throttle[0] = fly_sky_data[0] + _pitch_pid_value + _roll_pid_value;
-            throttle[1] = fly_sky_data[0] + _pitch_pid_value - _roll_pid_value;
-            throttle[2] = fly_sky_data[0] - _pitch_pid_value - _roll_pid_value;
-            throttle[3] = fly_sky_data[0] - _pitch_pid_value + _roll_pid_value;
-
-            for i in 0..4 {
-                if throttle[i] < 1000. {
-                    throttle[i] = 1000.;
-                }
-                if throttle[i] > 2000. {
-                    throttle[i] = 2000.;
-                }   
-            }
-            rprintln!("Pitch PID: {:?}, Roll PID: {:?}", _pitch_pid_value, _roll_pid_value);
-            rprintln!("Throttle: {:?}", throttle);
-
-            m1.set_duty(map(throttle[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16); 
-            m2.set_duty(map(throttle[0], 1000., 2000., m2.get_max_duty() as f32 / 20., m2.get_max_duty() as f32 / 10.) as u16);
-            m3.set_duty(map(throttle[0], 1000., 2000., m3.get_max_duty() as f32 / 20., m3.get_max_duty() as f32 / 10.) as u16);
-            m4.set_duty(map(throttle[0], 1000., 2000., m4.get_max_duty() as f32 / 20., m4.get_max_duty() as f32 / 10.) as u16);
-
-            *previous_throttle = throttle;
-
-        } else {
-            rprintln!("No new Flysky Data");
-            m1.set_duty(map(previous_throttle[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16); 
-            m2.set_duty(map(previous_throttle[1], 1000., 2000., m2.get_max_duty() as f32 / 20., m2.get_max_duty() as f32 / 10.) as u16);
-            m3.set_duty(map(previous_throttle[2], 1000., 2000., m3.get_max_duty() as f32 / 20., m3.get_max_duty() as f32 / 10.) as u16);
-            m4.set_duty(map(previous_throttle[3], 1000., 2000., m4.get_max_duty() as f32 / 20., m4.get_max_duty() as f32 / 10.) as u16);
-
-        }
+        throttle[0] = fly_sky_data[0] - _pitch_pid_value - _roll_pid_value; // front left
+        throttle[1] = fly_sky_data[0] - _pitch_pid_value + _roll_pid_value; // front right
+        //throttle[1] = 1000.;
         
+        throttle[2] = fly_sky_data[0] + _pitch_pid_value - _roll_pid_value; // rear left
+        throttle[3] = fly_sky_data[0] + _pitch_pid_value + _roll_pid_value; // rear right
+
+        for i in 0..4 {
+            if throttle[i] < 1000. {
+                throttle[i] = 1000.;
+            }
+            if throttle[i] > 2000. {
+                throttle[i] = 2000.;
+            }   
+        }
+        rprintln!("Pitch PID: {:?}, Roll PID: {:?}", _pitch_pid_value, _roll_pid_value);
+        rprintln!("Throttle: {:?}", throttle);
+
+
+        m1.set_duty(map(throttle[0], 1000., 2000., m1.get_max_duty() as f32 / 20., m1.get_max_duty() as f32 / 10.) as u16); 
+        m2.set_duty(map(throttle[1], 1000., 2000., m2.get_max_duty() as f32 / 20., m2.get_max_duty() as f32 / 10.) as u16);
+        m3.set_duty(map(throttle[2], 1000., 2000., m3.get_max_duty() as f32 / 20., m3.get_max_duty() as f32 / 10.) as u16);
+        m4.set_duty(map(throttle[3], 1000., 2000., m4.get_max_duty() as f32 / 20., m4.get_max_duty() as f32 / 10.) as u16);
     }
 }
